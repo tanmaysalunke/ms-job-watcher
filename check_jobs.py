@@ -1,64 +1,171 @@
 # check_jobs.py
 import os
-import requests
+import json
+import hashlib
 from pathlib import Path
 
-MICROSOFT_URL = "https://apply.careers.microsoft.com/careers?query=IC2&start=0&location=United+States&pid=1970393556621887&sort_by=timestamp&filter_include_remote=1"
+import requests
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-SEEN_FILE = Path("seen_jobs.txt")
+LAST_FILE = Path("last_job_id.txt")
+
+# Microsoft careers search API
+BASE_URL = "https://gcsservices.careers.microsoft.com/search/api/v1/search"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (job-watcher-bot)",
+    "Accept": "application/json",
+}
 
 
-def load_seen_ids():
-    if not SEEN_FILE.exists():
-        return set()
-    return set(line.strip() for line in SEEN_FILE.read_text().splitlines() if line.strip())
+def find_jobs_node(data):
+    """
+    Recursively search for a 'jobs' key in the JSON.
+    This makes us robust to schema changes like:
+      data["operationResult"]["result"]["jobs"]
+      or data["result"]["jobs"], etc.
+    """
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k.lower() == "jobs" and isinstance(v, list):
+                return v
+            found = find_jobs_node(v)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = find_jobs_node(item)
+            if found is not None:
+                return found
+    return None
 
 
-def save_seen_ids(ids):
-    SEEN_FILE.write_text("\n".join(sorted(ids)) + "\n")
+def get_current_top_ic2_job():
+    """
+    Call the Microsoft careers search API and return
+    the most recent IC2 job in the US.
+    """
+    params = {
+        "lc": "United States",   # location country
+        "l": "en_us",            # locale
+        "pg": 1,
+        "pgSz": 20,
+        "o": "PostingDate",      # sort by posting date
+        "flt": "true",
+        "query": "IC2",
+    }
+
+    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        print("Could not decode JSON from careers API:")
+        print(resp.text[:500])
+        return None, None
+
+    jobs = find_jobs_node(data)
+    if not jobs:
+        print("No 'jobs' list found in API response. Full top-level keys:", list(data.keys()))
+        return None, None
+
+    # Filter jobs where title contains "IC2"
+    ic2_jobs = []
+    for job in jobs:
+        title = str(job.get("title", "") or job.get("jobTitle", ""))
+        if "IC2" in title:
+            ic2_jobs.append(job)
+
+    if not ic2_jobs:
+        print("No IC2 jobs found in API response (maybe none are open right now).")
+        return None, None
+
+    job = ic2_jobs[0]  # already sorted by PostingDate in the API
+    title = str(job.get("title", "") or job.get("jobTitle", "Unknown title"))
+
+    # Try several possible ID fields; fall back to a hash if needed.
+    job_id = (
+        job.get("jobId")
+        or job.get("job_id")
+        or job.get("id")
+        or job.get("postingId")
+    )
+    if not job_id:
+        job_id = hashlib.md5(json.dumps(job, sort_keys=True).encode("utf-8")).hexdigest()
+
+    props = job.get("properties", {}) if isinstance(job.get("properties", {}), dict) else {}
+    primary_location = props.get("primaryLocation") or job.get("location") or "Unknown location"
+
+    # If we have a numeric/normal job ID, construct the usual URL. Otherwise
+    # fall back to the generic search page.
+    if isinstance(job_id, str) and job_id.isdigit():
+        job_url = f"https://careers.microsoft.com/jobs/{job_id}"
+    else:
+        job_url = "https://apply.careers.microsoft.com/careers?query=IC2&start=0&location=United+States&pid=1970393556621887&sort_by=timestamp&filter_include_remote=1"
+
+    desc = f"{title}\n{primary_location}\n{job_url}"
+
+    return str(job_id), desc
+
+
+def get_last_seen_id():
+    if LAST_FILE.exists():
+        return LAST_FILE.read_text().strip()
+    return None
+
+
+def set_last_seen_id(job_id: str):
+    LAST_FILE.write_text(job_id)
 
 
 def send_telegram_message(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10)
-    resp.raise_for_status()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    r = requests.post(
+        url,
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+        timeout=20,
+    )
+    r.raise_for_status()
 
 
-def parse_job_ids(html: str):
-    # TODO: Adjust this based on actual HTML/JSON.
-    # For now, we’ll do a hacky search for "jobId":"<something>"
-    import re
-    pattern = r'"jobId"\s*:\s*"(\d+)"'
-    return set(re.findall(pattern, html))
+def commit_if_changed():
+    """
+    Commit last_job_id.txt back to the repo so GitHub Actions has state between runs.
+    """
+    import subprocess
+
+    # configure a generic identity for the bot
+    subprocess.run(["git", "config", "user.name", "job-bot"], check=True)
+    subprocess.run(["git", "config", "user.email", "bot@example.com"], check=True)
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], capture_output=True, text=True
+    )
+    if status.stdout.strip():
+        subprocess.run(["git", "add", "last_job_id.txt"], check=True)
+        subprocess.run(["git", "commit", "-m", "Update last seen job id"], check=True)
+        subprocess.run(["git", "push"], check=True)
 
 
 def main():
-    seen = load_seen_ids()
-
-    resp = requests.get(MICROSOFT_URL, timeout=15, headers={"User-Agent": "TanmayJobWatcher/1.0"})
-    resp.raise_for_status()
-    html = resp.text
-
-    current_ids = parse_job_ids(html)
-
-    if not current_ids:
-        # Fail silently or send a debug message if you want
-        print("No job IDs found. Maybe pattern needs updating.")
+    job_id, desc = get_current_top_ic2_job()
+    if not job_id:
+        print("No job ID resolved from API.")
         return
 
-    new_ids = current_ids - seen
-    if new_ids:
-        for job_id in sorted(new_ids):
-            msg = f"New Microsoft IC2 job detected! Job ID: {job_id}\nLink: {MICROSOFT_URL}"
-            send_telegram_message(msg)
-        save_seen_ids(seen | current_ids)
-        print(f"Notified about {len(new_ids)} new jobs.")
-    else:
-        print("No new jobs.")
+    last = get_last_seen_id()
+    if last == job_id:
+        print("No new job.")
+        return
+
+    # New job detected (or first run)
+    send_telegram_message(f"🚨 New Microsoft IC2 job detected:\n\n{desc}")
+    set_last_seen_id(job_id)
+    commit_if_changed()
+
 
 if __name__ == "__main__":
     main()
-
