@@ -11,8 +11,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 LAST_FILE = Path("last_job_id.txt")
 
-# Use the exact search URL you saw in DevTools.
-# I also added filter_include_remote=1 so it matches your page link.
+# Exact search URL you captured, plus filter_include_remote=1
 SEARCH_URL = (
     "https://apply.careers.microsoft.com/api/pcsx/search"
     "?domain=microsoft.com"
@@ -31,15 +30,13 @@ HEADERS = {
 
 def find_jobs_list(node):
     """
-    Recursively search for a list of job-like objects in the JSON.
-    We treat any list of dicts with a 'title' or 'position_id' field
-    as the jobs list.
+    Recursively search for a list of job-like dicts in the JSON.
+    We treat any list of dicts as "jobs" – the first such list we find.
     """
     if isinstance(node, list):
         if node and isinstance(node[0], dict):
-            sample = node[0]
-            if any(k in sample for k in ("title", "jobTitle", "position_id", "positionId")):
-                return node
+            # We found a list of dicts; assume these are jobs/results.
+            return node
         for item in node:
             found = find_jobs_list(item)
             if found is not None:
@@ -54,17 +51,18 @@ def find_jobs_list(node):
     return None
 
 
-def get_current_top_ic2_job():
+def get_current_top_job():
     """
-    Call the Microsoft careers search API and return the most recent IC2 job.
+    Call the Microsoft careers search API and return the "top" job
+    from the results (API is already sorted by timestamp).
     """
     resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=20)
     try:
         resp.raise_for_status()
-    except requests.HTTPError as e:
+    except requests.HTTPError:
         print(f"[ERROR] HTTP {resp.status_code} from careers API")
         print(resp.text[:500])
-        raise
+        return None, None
 
     try:
         data = resp.json()
@@ -78,24 +76,23 @@ def get_current_top_ic2_job():
         print("[ERROR] No jobs list found in API response. Top-level keys:", list(data.keys()))
         return None, None
 
-    # We assume the API already sorts by timestamp (newest first),
-    # so take the first IC2 job in the list.
-    ic2_jobs = []
-    for job in jobs:
-        if not isinstance(job, dict):
-            continue
-        title = str(job.get("title") or job.get("jobTitle") or "")
-        if "IC2" in title:
-            ic2_jobs.append(job)
-
-    if not ic2_jobs:
-        print("No IC2 jobs found in API response (maybe none open right now).")
+    job = jobs[0]
+    if not isinstance(job, dict):
+        print("[ERROR] First job entry is not a dict:", type(job))
         return None, None
 
-    job = ic2_jobs[0]
-    title = str(job.get("title") or job.get("jobTitle") or "Unknown title")
+    # Debug print once to understand structure (trimmed)
+    print("Sample job keys:", list(job.keys())[:10])
 
-    # Choose a stable ID from common fields; fall back to a hash.
+    # Title
+    title = (
+        str(job.get("title"))
+        or str(job.get("Title"))
+        or str(job.get("jobTitle"))
+        or "Unknown title"
+    )
+
+    # Stable-ish ID
     job_id = (
         job.get("position_id")
         or job.get("positionId")
@@ -105,7 +102,7 @@ def get_current_top_ic2_job():
     if not job_id:
         job_id = hashlib.md5(json.dumps(job, sort_keys=True).encode("utf-8")).hexdigest()
 
-    # Try to get a location string
+    # Location
     location = (
         job.get("location")
         or job.get("primaryLocation")
@@ -113,7 +110,7 @@ def get_current_top_ic2_job():
         or "Unknown location"
     )
 
-    # Try to get a concrete job URL
+    # Job URL
     job_url = (
         job.get("applyUrl")
         or job.get("detailsUrl")
@@ -165,9 +162,8 @@ def commit_if_changed():
 
 def main():
     try:
-        job_id, desc = get_current_top_ic2_job()
+        job_id, desc = get_current_top_job()
     except Exception as e:
-        # Don't crash the workflow completely; just log.
         print(f"[ERROR] Failed to fetch jobs: {e}")
         return
 
