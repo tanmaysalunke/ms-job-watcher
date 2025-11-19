@@ -11,8 +11,17 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 LAST_FILE = Path("last_job_id.txt")
 
-# Microsoft careers search API
-BASE_URL = "https://gcsservices.careers.microsoft.com/search/api/v1/search"
+# Use the exact search URL you saw in DevTools.
+# I also added filter_include_remote=1 so it matches your page link.
+SEARCH_URL = (
+    "https://apply.careers.microsoft.com/api/pcsx/search"
+    "?domain=microsoft.com"
+    "&query=IC2"
+    "&location=United%20States"
+    "&start=0"
+    "&sort_by=timestamp"
+    "&filter_include_remote=1"
+)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (job-watcher-bot)",
@@ -20,94 +29,99 @@ HEADERS = {
 }
 
 
-def find_jobs_node(data):
+def find_jobs_list(node):
     """
-    Recursively search for a 'jobs' key in the JSON.
-    This makes us robust to schema changes like:
-      data["operationResult"]["result"]["jobs"]
-      or data["result"]["jobs"], etc.
+    Recursively search for a list of job-like objects in the JSON.
+    We treat any list of dicts with a 'title' or 'position_id' field
+    as the jobs list.
     """
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k.lower() == "jobs" and isinstance(v, list):
-                return v
-            found = find_jobs_node(v)
+    if isinstance(node, list):
+        if node and isinstance(node[0], dict):
+            sample = node[0]
+            if any(k in sample for k in ("title", "jobTitle", "position_id", "positionId")):
+                return node
+        for item in node:
+            found = find_jobs_list(item)
             if found is not None:
                 return found
-    elif isinstance(data, list):
-        for item in data:
-            found = find_jobs_node(item)
+
+    if isinstance(node, dict):
+        for v in node.values():
+            found = find_jobs_list(v)
             if found is not None:
                 return found
+
     return None
 
 
 def get_current_top_ic2_job():
     """
-    Call the Microsoft careers search API and return
-    the most recent IC2 job in the US.
+    Call the Microsoft careers search API and return the most recent IC2 job.
     """
-    params = {
-        "lc": "United States",   # location country
-        "l": "en_us",            # locale
-        "pg": 1,
-        "pgSz": 20,
-        "o": "PostingDate",      # sort by posting date
-        "flt": "true",
-        "query": "IC2",
-    }
-
-    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
+    resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=20)
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        print(f"[ERROR] HTTP {resp.status_code} from careers API")
+        print(resp.text[:500])
+        raise
 
     try:
         data = resp.json()
     except json.JSONDecodeError:
-        print("Could not decode JSON from careers API:")
+        print("[ERROR] Could not parse JSON from careers API:")
         print(resp.text[:500])
         return None, None
 
-    jobs = find_jobs_node(data)
+    jobs = find_jobs_list(data)
     if not jobs:
-        print("No 'jobs' list found in API response. Full top-level keys:", list(data.keys()))
+        print("[ERROR] No jobs list found in API response. Top-level keys:", list(data.keys()))
         return None, None
 
-    # Filter jobs where title contains "IC2"
+    # We assume the API already sorts by timestamp (newest first),
+    # so take the first IC2 job in the list.
     ic2_jobs = []
     for job in jobs:
-        title = str(job.get("title", "") or job.get("jobTitle", ""))
+        if not isinstance(job, dict):
+            continue
+        title = str(job.get("title") or job.get("jobTitle") or "")
         if "IC2" in title:
             ic2_jobs.append(job)
 
     if not ic2_jobs:
-        print("No IC2 jobs found in API response (maybe none are open right now).")
+        print("No IC2 jobs found in API response (maybe none open right now).")
         return None, None
 
-    job = ic2_jobs[0]  # already sorted by PostingDate in the API
-    title = str(job.get("title", "") or job.get("jobTitle", "Unknown title"))
+    job = ic2_jobs[0]
+    title = str(job.get("title") or job.get("jobTitle") or "Unknown title")
 
-    # Try several possible ID fields; fall back to a hash if needed.
+    # Choose a stable ID from common fields; fall back to a hash.
     job_id = (
-        job.get("jobId")
-        or job.get("job_id")
+        job.get("position_id")
+        or job.get("positionId")
+        or job.get("jobId")
         or job.get("id")
-        or job.get("postingId")
     )
     if not job_id:
         job_id = hashlib.md5(json.dumps(job, sort_keys=True).encode("utf-8")).hexdigest()
 
-    props = job.get("properties", {}) if isinstance(job.get("properties", {}), dict) else {}
-    primary_location = props.get("primaryLocation") or job.get("location") or "Unknown location"
+    # Try to get a location string
+    location = (
+        job.get("location")
+        or job.get("primaryLocation")
+        or job.get("geo")
+        or "Unknown location"
+    )
 
-    # If we have a numeric/normal job ID, construct the usual URL. Otherwise
-    # fall back to the generic search page.
-    if isinstance(job_id, str) and job_id.isdigit():
-        job_url = f"https://careers.microsoft.com/jobs/{job_id}"
-    else:
-        job_url = "https://apply.careers.microsoft.com/careers?query=IC2&start=0&location=United+States&pid=1970393556621887&sort_by=timestamp&filter_include_remote=1"
+    # Try to get a concrete job URL
+    job_url = (
+        job.get("applyUrl")
+        or job.get("detailsUrl")
+        or job.get("detailsURL")
+        or "https://apply.careers.microsoft.com/careers?query=IC2&start=0&location=United+States&pid=1970393556621887&sort_by=timestamp&filter_include_remote=1"
+    )
 
-    desc = f"{title}\n{primary_location}\n{job_url}"
-
+    desc = f"{title}\n{location}\n{job_url}"
     return str(job_id), desc
 
 
@@ -137,7 +151,6 @@ def commit_if_changed():
     """
     import subprocess
 
-    # configure a generic identity for the bot
     subprocess.run(["git", "config", "user.name", "job-bot"], check=True)
     subprocess.run(["git", "config", "user.email", "bot@example.com"], check=True)
 
@@ -151,7 +164,13 @@ def commit_if_changed():
 
 
 def main():
-    job_id, desc = get_current_top_ic2_job()
+    try:
+        job_id, desc = get_current_top_ic2_job()
+    except Exception as e:
+        # Don't crash the workflow completely; just log.
+        print(f"[ERROR] Failed to fetch jobs: {e}")
+        return
+
     if not job_id:
         print("No job ID resolved from API.")
         return
