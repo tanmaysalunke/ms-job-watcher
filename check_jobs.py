@@ -81,36 +81,44 @@ def get_current_top_job():
         print("[ERROR] First job entry is not a dict:", type(job))
         return None, None
 
-    # Debug print once to understand structure (trimmed)
+    # Debug so we know structure
     print("Sample job keys:", list(job.keys())[:10])
 
-    # Title
-    title = (
-        str(job.get("title"))
-        or str(job.get("Title"))
-        or str(job.get("jobTitle"))
-        or "Unknown title"
-    )
+    # ----- Title -----
+    raw_name = job.get("name") or job.get("title") or job.get("jobTitle")
+    if isinstance(raw_name, str) and raw_name.strip():
+        title = raw_name.strip()
+    else:
+        title = "Unknown title"
 
-    # Stable-ish ID
+    # ----- Stable-ish ID -----
     job_id = (
-        job.get("position_id")
+        job.get("id")
+        or job.get("displayJobId")
+        or job.get("position_id")
         or job.get("positionId")
-        or job.get("jobId")
-        or job.get("id")
     )
     if not job_id:
         job_id = hashlib.md5(json.dumps(job, sort_keys=True).encode("utf-8")).hexdigest()
 
-    # Location
-    location = (
-        job.get("location")
-        or job.get("primaryLocation")
-        or job.get("geo")
-        or "Unknown location"
-    )
+    # ----- Location -----
+    locs = job.get("locations") or job.get("standardizedLocations")
 
-    # Job URL
+    if isinstance(locs, list) and locs:
+        first = locs[0]
+        if isinstance(first, dict):
+            # Grab non-empty values from the first location dict
+            parts = [str(v) for v in first.values() if v]
+            location = ", ".join(parts) if parts else "Unknown location"
+        else:
+            # List of strings
+            location = ", ".join(str(x) for x in locs)
+    elif isinstance(locs, str) and locs.strip():
+        location = locs.strip()
+    else:
+        location = "Unknown location"
+
+    # ----- Job URL -----
     job_url = (
         job.get("applyUrl")
         or job.get("detailsUrl")
