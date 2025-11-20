@@ -9,13 +9,26 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-LAST_FILE = Path("last_job_id.txt")
+# Separate state files for each search
+LAST_IC2_FILE = Path("last_job_ic2.txt")
+LAST_SWE_FILE = Path("last_job_swe.txt")
 
-# Exact search URL you captured, plus filter_include_remote=1
-SEARCH_URL = (
+# IC2 search (API version of your existing URL)
+SEARCH_URL_IC2 = (
     "https://apply.careers.microsoft.com/api/pcsx/search"
     "?domain=microsoft.com"
     "&query=IC2"
+    "&location=United%20States"
+    "&start=0"
+    "&sort_by=timestamp"
+    "&filter_include_remote=1"
+)
+
+# Software Engineer search (based on your new URL)
+SEARCH_URL_SWE = (
+    "https://apply.careers.microsoft.com/api/pcsx/search"
+    "?domain=microsoft.com"
+    "&query=Software%20Engineer"
     "&location=United%20States"
     "&start=0"
     "&sort_by=timestamp"
@@ -31,11 +44,10 @@ HEADERS = {
 def find_jobs_list(node):
     """
     Recursively search for a list of job-like dicts in the JSON.
-    We treat any list of dicts as "jobs" – the first such list we find.
+    We treat any non-empty list of dicts as the jobs list.
     """
     if isinstance(node, list):
         if node and isinstance(node[0], dict):
-            # We found a list of dicts; assume these are jobs/results.
             return node
         for item in node:
             found = find_jobs_list(item)
@@ -51,38 +63,37 @@ def find_jobs_list(node):
     return None
 
 
-def get_current_top_job():
+def fetch_top_job(search_url: str, label: str):
     """
-    Call the Microsoft careers search API and return the "top" job
-    from the results (API is already sorted by timestamp).
+    Call the careers API for a given search URL and return (job_id, desc).
     """
-    resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=20)
+    resp = requests.get(search_url, headers=HEADERS, timeout=20)
     try:
         resp.raise_for_status()
     except requests.HTTPError:
-        print(f"[ERROR] HTTP {resp.status_code} from careers API")
+        print(f"[{label}] [ERROR] HTTP {resp.status_code} from careers API")
         print(resp.text[:500])
         return None, None
 
     try:
         data = resp.json()
     except json.JSONDecodeError:
-        print("[ERROR] Could not parse JSON from careers API:")
+        print(f"[{label}] [ERROR] Could not parse JSON from careers API:")
         print(resp.text[:500])
         return None, None
 
     jobs = find_jobs_list(data)
     if not jobs:
-        print("[ERROR] No jobs list found in API response. Top-level keys:", list(data.keys()))
+        print(f"[{label}] [ERROR] No jobs list found. Top-level keys: {list(data.keys())}")
         return None, None
 
     job = jobs[0]
     if not isinstance(job, dict):
-        print("[ERROR] First job entry is not a dict:", type(job))
+        print(f"[{label}] [ERROR] First job entry is not a dict: {type(job)}")
         return None, None
 
-    # Debug so we know structure
-    print("Sample job keys:", list(job.keys())[:10])
+    # Debug keys once
+    print(f"[{label}] Sample job keys:", list(job.keys())[:10])
 
     # ----- Title -----
     raw_name = job.get("name") or job.get("title") or job.get("jobTitle")
@@ -107,11 +118,9 @@ def get_current_top_job():
     if isinstance(locs, list) and locs:
         first = locs[0]
         if isinstance(first, dict):
-            # Grab non-empty values from the first location dict
             parts = [str(v) for v in first.values() if v]
             location = ", ".join(parts) if parts else "Unknown location"
         else:
-            # List of strings
             location = ", ".join(str(x) for x in locs)
     elif isinstance(locs, str) and locs.strip():
         location = locs.strip()
@@ -123,21 +132,21 @@ def get_current_top_job():
         job.get("applyUrl")
         or job.get("detailsUrl")
         or job.get("detailsURL")
-        or "https://apply.careers.microsoft.com/careers?query=IC2&start=0&location=United+States&pid=1970393556621887&sort_by=timestamp&filter_include_remote=1"
+        or search_url.replace("/api/pcsx/search", "/careers")
     )
 
     desc = f"{title}\n{location}\n{job_url}"
     return str(job_id), desc
 
 
-def get_last_seen_id():
-    if LAST_FILE.exists():
-        return LAST_FILE.read_text().strip()
+def get_last_seen_id(path: Path):
+    if path.exists():
+        return path.read_text().strip()
     return None
 
 
-def set_last_seen_id(job_id: str):
-    LAST_FILE.write_text(job_id)
+def set_last_seen_id(path: Path, job_id: str):
+    path.write_text(job_id)
 
 
 def send_telegram_message(text: str):
@@ -152,7 +161,7 @@ def send_telegram_message(text: str):
 
 def commit_if_changed():
     """
-    Commit last_job_id.txt back to the repo so GitHub Actions has state between runs.
+    Commit last_job_*.txt back to the repo so GitHub Actions has state between runs.
     """
     import subprocess
 
@@ -162,31 +171,58 @@ def commit_if_changed():
     status = subprocess.run(
         ["git", "status", "--porcelain"], capture_output=True, text=True
     )
-    if status.stdout.strip():
-        subprocess.run(["git", "add", "last_job_id.txt"], check=True)
-        subprocess.run(["git", "commit", "-m", "Update last seen job id"], check=True)
-        subprocess.run(["git", "push"], check=True)
+    if not status.stdout.strip():
+        print("No changes to commit.")
+        return
+
+    files_to_add = []
+    if LAST_IC2_FILE.exists():
+        files_to_add.append(str(LAST_IC2_FILE))
+    if LAST_SWE_FILE.exists():
+        files_to_add.append(str(LAST_SWE_FILE))
+
+    if not files_to_add:
+        print("No state files to add.")
+        return
+
+    subprocess.run(["git", "add", *files_to_add], check=True)
+    subprocess.run(["git", "commit", "-m", "Update last seen job ids"], check=True)
+    subprocess.run(["git", "push"], check=True)
 
 
-def main():
+def check_search(label: str, search_url: str, state_file: Path):
+    """
+    Generic checker: fetch top job, compare to last seen, send Telegram if new.
+    """
     try:
-        job_id, desc = get_current_top_job()
+        job_id, desc = fetch_top_job(search_url, label)
     except Exception as e:
-        print(f"[ERROR] Failed to fetch jobs: {e}")
+        print(f"[{label}] [ERROR] Failed to fetch jobs: {e}")
         return
 
     if not job_id:
-        print("No job ID resolved from API.")
+        print(f"[{label}] No job ID resolved from API.")
         return
 
-    last = get_last_seen_id()
+    last = get_last_seen_id(state_file)
     if last == job_id:
-        print("No new job.")
+        print(f"[{label}] No new job.")
         return
 
     # New job detected (or first run)
-    send_telegram_message(f"🚨 New Microsoft IC2 job detected:\n\n{desc}")
-    set_last_seen_id(job_id)
+    send_telegram_message(f"🚨 New job detected for {label} search:\n\n{desc}")
+    set_last_seen_id(state_file, job_id)
+    print(f"[{label}] Updated last seen job to {job_id}")
+
+
+def main():
+    # Check IC2 search
+    check_search("IC2", SEARCH_URL_IC2, LAST_IC2_FILE)
+
+    # Check Software Engineer search
+    check_search("Software Engineer (US)", SEARCH_URL_SWE, LAST_SWE_FILE)
+
+    # Commit any state changes
     commit_if_changed()
 
 
